@@ -1,0 +1,133 @@
+ext.ullinkGradleScripts = 'https://raw.github.com/gluck/gradle-scripts/master'
+apply from: "${ext.ullinkGradleScripts}/task-rules.gradle"
+apply from: "${ext.ullinkGradleScripts}/functions.gradle"
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath "com.ullink.gradle:gradle-msbuild-plugin:1.9"
+        classpath "com.ullink.gradle:gradle-nuget-plugin:1.1"
+    }
+}
+
+apply plugin:'msbuild'
+apply plugin:'nuget'
+
+archivesBaseName = 'ILRepack'
+version = '1.25.0'
+
+defaultTasks('nugetPack')
+
+def removeExtension(String path) {
+    path.replaceFirst(~/(?<=.)\.[^\.]+$/, '')
+}
+
+msbuild {
+    def netVersion = project.version + '.0'
+    replaceAssemblyAttribute('ILRepack/Properties/AssemblyInfo.cs', 'AssemblyVersion', netVersion)
+    replaceAssemblyAttribute('ILRepack/Properties/AssemblyInfo.cs', 'AssemblyFileVersion', netVersion)
+    
+    solutionFile = 'ILRepack.sln'
+    configuration = 'Debug'
+    projectName = 'ILRepack'
+    inputs.file(project.buildFile)
+}
+
+ext.repackList = ['ILRepack.exe', 'Mono.Cecil.dll', 'Mono.Cecil.Mdb.dll', 'Mono.Cecil.Pdb.dll', 'Mono.Posix.dll']
+
+// repacking of all dependencies in a single exe
+task repack(dependsOn: msbuild) {
+    inputs.files {
+        workingDir = msbuild.mainProject.getProjectPropertyPath('OutputPath')
+        return project.ext.repackList.collect { new File(workingDir, it) }
+    }
+    ext.repacked = new File(temporaryDir, 'ILRepack.exe')
+    ext.repackedLib = new File(temporaryDir, 'ILRepack.dll')
+    outputs.files([ext.repacked, ext.repackedLib, removeExtension(ext.repacked.path)+'.pdb'])
+}
+
+repack << {
+    exec {
+        workingDir = msbuild.mainProject.getProjectPropertyPath('OutputPath')
+        commandLine = [new File(workingDir, 'ILRepack.exe'), '/log', '/wildcards', '/internalize', '/ndebug', '/out:'+ext.repacked] + project.ext.repackList
+    }
+    exec {
+        workingDir = msbuild.mainProject.getProjectPropertyPath('OutputPath')
+        commandLine = [new File(workingDir, 'ILRepack.exe'), '/log', '/wildcards', '/internalize', '/keyfile:'+file('ILRepack/ILRepack.snk'), '/out:'+ext.repackedLib, '/target:library'] + project.ext.repackList
+    }
+}
+
+// bootstrap ILRepack exe for integrity checking
+task bootstrap(dependsOn: repack) {
+    inputs.files repack.outputs
+    ext.tmp = new File(temporaryDir, 'ILRepack_tmp.exe')
+    outputs.files([ext.tmp, removeExtension(ext.tmp.path)+'.pdb'])
+}
+
+bootstrap << {
+    exec {
+        commandLine = [repack.ext.repacked, '/log', '/out:'+ext.tmp, repack.ext.repacked]
+    }
+}
+
+def commonNuspecMetadata(def meta) {
+    meta.version version
+    meta.title 'ILRepack - Open-source alternative to ILMerge'
+    meta.authors 'Francois Valdy'
+    meta.owners 'Francois Valdy'
+    meta.projectUrl('https://github.com/gluck/il-repack')
+    meta.copyright 'Copyright © Francois Valdy 2011-2014'
+}
+
+// nuget package for upload to nuget
+nugetPack {
+    nuspec {
+        metadata() {
+            commonNuspecMetadata(delegate)
+            id archivesBaseName
+            delegate.description '''ILRepack is meant at replacing ILMerge / Mono.Merge.
+            The former being closed-source, impossible to customize, slow, resource consuming and many more. The later being deprecated, unsupported, and based on an old version of Mono.Cecil.'''
+            requireLicenseAcceptance false
+            summary 'ILRepack is a utility that can be used to merge multiple .NET assemblies into a single assembly'
+        }
+        delegate.files() {
+            delegate.file(src: repack.ext.repacked, target: 'tools')
+        }
+    }
+}
+
+task nugetPackLib(type: com.ullink.NuGetPack) {
+    nuspec {
+        metadata() {
+            commonNuspecMetadata(delegate)
+            id archivesBaseName+'.Lib'
+            delegate.description '''ILRepack is meant at replacing ILMerge / Mono.Merge.
+            The former being closed-source, impossible to customize, slow, resource consuming and many more. The later being deprecated, unsupported, and based on an old version of Mono.Cecil.
+            
+            This package provides a library, for use within tools/build projects.
+            If you need the tool as an executable, this is not the package you're looking for, this one is: http://www.nuget.org/packages/ILRepack/.'''
+            requireLicenseAcceptance false
+            summary 'ILRepack is a utility that can be used to merge multiple .NET assemblies into a single assembly (Packaged as library)'
+        }
+        delegate.files() {
+            delegate.file(src: repack.ext.repackedLib, target: 'lib')
+        }
+    }
+}
+
+nugetPack.dependsOn([repack, bootstrap, msbuild, nugetPackLib])
+
+// nuget package upload, requires API key to be set
+nugetPush {
+    nupkgFile = nugetPack.getPackageFile()
+}
+
+task nugetPushLib(type: com.ullink.NuGetPush) {
+    nupkgFile = nugetPackLib.getPackageFile()
+}
+
+nugetPush.dependsOn(nugetPushLib)
